@@ -7,7 +7,7 @@ HttpMediaResolver.java expects. Uses the open-source yt-dlp library.
 Notes
 - Works only for publicly accessible posts/Reels. Private or login-only content returns error "private".
 - It does not use or store any Instagram login or cookies.
-- Instagram changes often: keep yt-dlp updated (pip install -U yt-dlp).
+- Instagram changes often: keep yt-dlp updated.
 - You are responsible for complying with Instagram's terms and the law where you run this.
 """
 import os
@@ -38,37 +38,45 @@ def mime_for(ext):
     }.get(ext, "")
 
 
+def fail(error, detail=""):
+    return jsonify(ok=False, error=error, detail=(detail or "")[:200])
+
+
 @app.get("/health")
 def health():
-    return jsonify(ok=True)
+    return jsonify(ok=True, ytdlp=yt_dlp.version.__version__)
 
 
 @app.get("/resolve")
 def resolve():
     url = request.args.get("url", "").strip()
     if not host_ok(url):
-        return jsonify(ok=False, error="unsupported")
+        return fail("unsupported", "not an instagram url")
 
     opts = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
-        "format": "best[ext=mp4]/best",
+        "ignore_no_formats_error": True,   # photo posts have no video formats
         "socket_timeout": 20,
     }
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as e:
-        msg = str(e).lower()
-        if "login" in msg or "private" in msg or "log in" in msg or "restricted" in msg:
-            return jsonify(ok=False, error="private")
-        if "not found" in msg or "unavailable" in msg or "404" in msg or "removed" in msg:
-            return jsonify(ok=False, error="not_found")
-        return jsonify(ok=False, error="unsupported")
-    except Exception:
-        return jsonify(ok=False, error="unsupported")
+        msg = str(e)
+        low = msg.lower()
+        if "login" in low or "log in" in low or "private" in low or "restricted" in low:
+            return fail("private", msg)
+        if "not found" in low or "unavailable" in low or "404" in low or "removed" in low:
+            return fail("not_found", msg)
+        return fail("unsupported", msg)
+    except Exception as e:  # noqa
+        return fail("unsupported", str(e))
+
+    if not info:
+        return fail("unsupported", "empty result")
 
     # carousel posts: use the first item
     entries = info.get("entries")
@@ -76,18 +84,29 @@ def resolve():
         info = next((e for e in entries if e), None) or {}
 
     media_url = info.get("url")
+    ext = info.get("ext")
+
     if not media_url:
-        fmts = [f for f in (info.get("formats") or []) if f.get("url")]
+        fmts = [f for f in (info.get("formats") or []) if f.get("url") and f.get("vcodec") != "none"]
         if fmts:
             media_url = fmts[-1]["url"]
-            info.setdefault("ext", fmts[-1].get("ext"))
+            ext = fmts[-1].get("ext") or ext
+
+    # photo post: no video at all -> take the largest image
+    if not media_url and not info.get("duration"):
+        thumbs = [t for t in (info.get("thumbnails") or []) if t.get("url")]
+        if thumbs:
+            best = max(thumbs, key=lambda t: (t.get("width") or 0) * (t.get("height") or 0))
+            media_url = best["url"]
+            ext = "jpg"
+
     if not media_url or not media_url.startswith("https://"):
-        return jsonify(ok=False, error="unsupported")
+        return fail("unsupported", "no downloadable media found")
 
     return jsonify(
         ok=True,
         mediaUrl=media_url,
-        mimeType=mime_for(info.get("ext")),
+        mimeType=mime_for(ext),
         thumbnailUrl=info.get("thumbnail") or "",
         title=(info.get("title") or info.get("description") or "")[:200],
         author=info.get("uploader") or info.get("channel") or "",
