@@ -6,21 +6,34 @@ HttpMediaResolver.java expects. Uses the open-source yt-dlp library.
 
 - Public posts/Reels only. Private or login-only content returns error "private".
 - No Instagram login or cookies are used or stored.
-- If a video's picture and sound are separate streams, both URLs are returned
-  (mediaUrl + audioUrl) and the Android app merges them into one MP4 with sound.
+- Instagram often delivers picture and sound as separate streams. This server merges them
+  with ffmpeg (stream copy, no re-encoding) at /merge and returns ONE normal MP4 URL with sound.
+  If ffmpeg is unavailable it falls back to returning mediaUrl + audioUrl (the app can merge on-device).
 - Results are cached in memory for 15 minutes so repeated searches are instant.
 """
+import hashlib
 import os
+import subprocess
+import tempfile
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_file
 import yt_dlp
+
+try:                                    # bundled ffmpeg binary (pip package imageio-ffmpeg)
+    import imageio_ffmpeg
+    FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:                       # noqa
+    FFMPEG = None
 
 app = Flask(__name__)
 
 ALLOWED_HOSTS = ("instagram.com", "instagr.am")
+CDN_SUFFIXES = (".fbcdn.net", ".cdninstagram.com")      # /merge only fetches from Instagram CDNs
+MERGE_DIR = os.path.join(tempfile.gettempdir(), "instagen_merge")
+os.makedirs(MERGE_DIR, exist_ok=True)
 CACHE_TTL = 15 * 60
 _cache = {}
 _lock = threading.Lock()
@@ -84,9 +97,57 @@ def pick_streams(info):
     return "", "", None
 
 
+def cdn_ok(url):
+    try:
+        u = urlparse(url)
+    except ValueError:
+        return False
+    h = (u.hostname or "").lower()
+    return u.scheme == "https" and any(h.endswith(s) for s in CDN_SUFFIXES)
+
+
+def cleanup_merge_dir():
+    now = time.time()
+    for name in os.listdir(MERGE_DIR):
+        p = os.path.join(MERGE_DIR, name)
+        try:
+            if now - os.path.getmtime(p) > 30 * 60:
+                os.remove(p)
+        except OSError:
+            pass
+
+
 @app.get("/health")
 def health():
-    return jsonify(ok=True, ytdlp=yt_dlp.version.__version__)
+    return jsonify(ok=True, ytdlp=yt_dlp.version.__version__, ffmpeg=bool(FFMPEG))
+
+
+@app.get("/merge")
+def merge():
+    """Merges a video-only and an audio-only stream into one MP4 (stream copy) and serves it."""
+    v = request.args.get("v", "")
+    a = request.args.get("a", "")
+    if not FFMPEG or not cdn_ok(v) or not cdn_ok(a):
+        return fail("unsupported", "merge not available"), 400
+    cleanup_merge_dir()
+    name = hashlib.sha1((v + "|" + a).encode()).hexdigest() + ".mp4"
+    out = os.path.join(MERGE_DIR, name)
+    if not os.path.exists(out):
+        tmp = out + ".part"
+        ua = "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36"
+        cmd = [FFMPEG, "-y", "-loglevel", "error",
+               "-user_agent", ua, "-i", v,
+               "-user_agent", ua, "-i", a,
+               "-map", "0:v:0", "-map", "1:a:0",
+               "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=100)
+        except subprocess.TimeoutExpired:
+            return fail("unsupported", "merge timeout"), 504
+        if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+            return fail("unsupported", (r.stderr or b"").decode("utf8", "ignore")[-180:]), 502
+        os.replace(tmp, out)
+    return send_file(out, mimetype="video/mp4", conditional=True)
 
 
 @app.get("/resolve")
@@ -142,6 +203,12 @@ def resolve():
         return fail("unsupported", "no downloadable media found")
     if audio_url and not audio_url.startswith("https://"):
         audio_url = ""
+
+    # picture + sound separate -> hand the app ONE merged MP4 URL (ffmpeg stream copy on this server)
+    if audio_url and FFMPEG and cdn_ok(media_url) and cdn_ok(audio_url):
+        media_url = "https://%s/merge?%s" % (request.host, urlencode({"v": media_url, "a": audio_url}))
+        audio_url = ""
+        ext = "mp4"
 
     result = dict(
         ok=True,
